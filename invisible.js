@@ -272,6 +272,8 @@
     font-size:18px;font-weight:400;color:#4E4E4E;letter-spacing:.1px;line-height:1}
   /* Lite 没有签名信任机制，不显示一个并不成立的状态 */
   .jp-NotebookTrustedStatus{display:none !important}
+  /* 内核图标：用 Python 官方图标；PY/WASM 是发行版标识，去掉 */
+  .jp-NotebookKernelLogo > :not(img){display:none !important}
   /* ---- 入口 ---- */
   #ic-trigger{position:fixed;right:0;bottom:0;width:56px;height:56px;z-index:99998;cursor:default;
     opacity:0;transition:opacity .3s ease}
@@ -416,6 +418,12 @@
       document.querySelectorAll('.jp-ToolbarButtonComponent-label').forEach(el => {
         const t = (el.textContent || '').trim();
         if (/^Python \(/.test(t)) el.textContent = 'Python 3 (Pyodide)';
+      });
+      /* 内核图标换成 Python 官方图标 */
+      let want = '';
+      try { want = new URL('../python-logo.svg', location.href).href; } catch (e) { return; }
+      document.querySelectorAll('.jp-NotebookKernelLogo img').forEach(img => {
+        if (img.getAttribute('src') !== want) img.setAttribute('src', want);
       });
     };
 
