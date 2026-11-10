@@ -75,66 +75,38 @@
     return false;
   }
 
-  async function acquireEditor() {
+  /* 找一个干净的单元格：优先当前空 cell，其次已有的空 cell，
+     都没有就在最后插一个。绝不往有内容的 cell 里追加 */
+  async function acquireFreshCell() {
     const nb = nbEl();
     if (!nb) return null;
+
     const active = nb.querySelector('.jp-Cell.jp-mod-active');
     if (active && cellEmpty(active)) return active.querySelector('.cm-content');
-    if (clickInsertBelow()) await sleep(180);
-    const cells = nb.querySelectorAll('.jp-Cell');
-    const last = cells[cells.length - 1];
-    return last ? last.querySelector('.cm-content') : null;
-  }
 
-  /* ================= 流式生成 ================= */
-
-  /* 围栏过滤器：模型偶尔仍会加 ``` 包裹。为了做到流式，
-     头部先缓冲到能判定，尾部保留 20 字符直到结束再收尾。 */
-  function makeFilter(out) {
-    let head = '';
-    let started = false;
-    let buf = '';
-    const TAIL = 20;
-
-    function emit(s) {
-      if (!s) return;
-      buf += s;
-      if (buf.length > TAIL) {
-        out(buf.slice(0, buf.length - TAIL));
-        buf = buf.slice(buf.length - TAIL);
-      }
+    const cells = [...nb.querySelectorAll('.jp-Cell')];
+    for (let i = cells.length - 1; i >= 0; i--) {
+      if (cellEmpty(cells[i])) return cells[i].querySelector('.cm-content');
     }
 
-    return {
-      push(chunk) {
-        if (!started) {
-          head += chunk;
-          if (head.length < 4 && head.indexOf('\n') === -1) return;
-          const m = /^```[a-zA-Z0-9_-]*\r?\n/.exec(head);
-          started = true;
-          if (m) head = head.slice(m[0].length);
-          else if (/^```/.test(head)) head = head.replace(/^```[a-zA-Z0-9_-]*/, '');
-        } else {
-          head += chunk;
-        }
-        const keep = started ? head : '';
-        if (!keep) return;
-        head = '';
-        emit(keep);
-      },
-      finish() {
-        let rest = buf;
-        if (head) rest = (rest || '') + head;
-        rest = rest.replace(/\r?\n?```\s*$/, '');
-        rest = rest.replace(/^\s*\n+/, '');
-        buf = '';
-        if (rest) out(rest);
+    const before = new Set(cells);
+    if (!clickInsertBelow()) return null;
+    for (let i = 0; i < 25; i++) {
+      await sleep(60);
+      const now = [...nb.querySelectorAll('.jp-Cell')];
+      const fresh = now.filter(c => !before.has(c));
+      if (fresh.length) {
+        const c = fresh[fresh.length - 1];
+        if (cellEmpty(c)) return c.querySelector('.cm-content');
+        /* 新 cell 还没挂上内容区，再等一拍 */
       }
-    };
+    }
+    return null;
   }
 
+  /* ================= 文本抽取 ================= */
+
   const norm = s => (s || '').replace(/\u200b/g, '').replace(/\r/g, '');
-  const pack = s => (s || '').replace(/\s+/g, '');   // 忽略缩进，只比内容
 
   /* 找到单元格的 CodeMirror 视图：绕开浏览器的括号自动补全与自动缩进 */
   function cmViewOf(cm) {
@@ -144,83 +116,25 @@
     return (v && v.state && typeof v.dispatch === 'function') ? v : null;
   }
 
-  /* 往编辑器里塞一块文本，并确认它真的进去了 */
-  function insertPiece(cm, piece) {
-    const v = cmViewOf(cm);
-    if (v) {
-      const sel = v.state.selection.main;
-      const before = v.state.doc.length;
-      v.dispatch({
-        changes: { from: sel.from, to: sel.to, insert: piece },
-        selection: { anchor: sel.from + piece.length }
-      });
-      return v.state.doc.length === before - (sel.to - sel.from) + piece.length;
-    }
-
-    /* 没有 CM6 视图时退回浏览器输入管线，并确认长度增长 */
-    const host = cm.closest('.cm-editor') || cm;
-    const before = norm(host.innerText).length;
-    try { document.execCommand('insertText', false, piece); } catch (e) {}
-    let now = norm(host.innerText);
-    if (now.length === before) {
-      const target = host.querySelector('.cm-content') || host;
-      try { target.focus(); } catch (e) {}
-      try {
-        target.dispatchEvent(new InputEvent('beforeinput', {
-          inputType: 'insertText', data: piece, bubbles: true, cancelable: true
-        }));
-      } catch (e) {}
-      now = norm(host.innerText);
-      if (now.length === before) return false;
-    }
-    return now.endsWith(norm(piece)) ? true : 'partial';
-  }
-
-  /* 兜底：内容对不上时整段重写（只在异常路径上用） */
-  function repairCell(cm, want) {
+  /* 一次性写入整段代码：直接改 CodeMirror 文档，
+     不经过按键管线，也就没有自动补全、自动缩进插进来的多余字符 */
+  function pasteCode(cm, code) {
     const v = cmViewOf(cm);
     if (v) {
       v.dispatch({
-        changes: { from: 0, to: v.state.doc.length, insert: want },
-        selection: { anchor: want.length }
+        changes: { from: 0, to: v.state.doc.length, insert: code },
+        selection: { anchor: code.length }
       });
-      return;
+      try { v.focus(); } catch (e) {}
+      return norm(cm.innerText || '') !== '' || v.state.doc.length === code.length;
     }
+    /* 没有 CM6 视图时的退路 */
     const host = cm.closest('.cm-editor') || cm;
-    host.focus();
+    try { host.focus(); } catch (e) {}
     try { document.execCommand('selectAll'); } catch (e) {}
-    try { document.execCommand('insertText', false, want); } catch (e) {}
-  }
-
-  /* 打字器：从队列消费，走浏览器真实输入管线 */
-  async function typeLoop(cm, T) {
-    cm.focus();
-    let idx = 0;
-    let idle = 0;
-    while (true) {
-      if (T.err) throw T.err;
-      const remain = T.text.length - idx;
-      if (remain > 0) {
-        const step = remain > 800 ? 8 : remain > 300 ? 3 : 1;
-        const piece = T.text.slice(idx, idx + step);
-        let ok = false;
-        for (let tryN = 0; tryN < 5 && !ok; tryN++) {
-          const r = insertPiece(cm, piece);
-          if (r === true) ok = true;
-          else if (r === 'partial') { ok = true; T.suspect = true; }
-          else { cm.focus(); await sleep(25 + tryN * 35); }
-        }
-        /* 实在塞不进去就报错，别让后面的字错位 */
-        if (!ok) { const e = new Error('editor-busy'); e.code = 'editor'; throw e; }
-        idx += step;
-        idle = 0;
-        await sleep(7 + Math.random() * 9);
-        continue;
-      }
-      if (T.done) break;
-      if (++idle > 400) break; // 20s 无数据，放弃
-      await sleep(50);
-    }
+    try { document.execCommand('insertText', false, code); } catch (e) {}
+    const want = norm(code).replace(/\s+/g, '');
+    return norm(host.innerText).replace(/\s+/g, '').indexOf(want) === 0;
   }
 
   /* ================= 本机网关通道（ACP over HTTP） ================= */
@@ -259,73 +173,92 @@
     }
   }
 
-  /* agent 回的是自然语言，这里只留代码。
-     1) 有围栏就取围栏内容
-     2) 没有围栏就找第一处"像代码"的位置，之前的说明文字整体丢掉 */
-  function findCodeStart(raw) {
-    /* 1) 有围栏：直接取围栏里的内容 */
-    const f = /```[a-zA-Z0-9_+-]*\r?\n/.exec(raw);
-    if (f) return f.index + f[0].length;
-    /* 2) 赋值语句最可靠，prose 里几乎不会出现 name = … */
-    const a = /[A-Za-z_]\w*(?:\[[^\]\n]*\])?(?:\.[A-Za-z_]\w*)*\s*=(?!=)/.exec(raw);
-    /* 3) 语句开头 */
-    const b = /(?:^|\n)[ \t]*(?:import\s|from\s+[A-Za-z_.]+\s+import\s|def\s|class\s|#|for\s|while\s|if\s|print\s*\(|@)/.exec(raw);
-    const cand = [];
-    if (a) cand.push(a.index);
-    if (b) cand.push(b.index + (b[0].startsWith("\n") ? 1 : 0));
-    return cand.length ? Math.min.apply(null, cand) : -1;
+  /* ---------- 全量清洗 ----------
+     模型回的是自然语言，这里等整段收完之后一次性切成代码。
+     逐行分类 → 取代码区间 → 丢掉夹在中间的说明 → 标点归一 → 去公共缩进 */
+
+  /* 一行是什么：blank / comment / prose / fence / code */
+  function classify(t) {
+    const s = (t || '').trim();
+    if (!s) return 'blank';
+    if (/^```/.test(s)) return 'fence';
+    if (/^#/.test(s)) return 'comment';
+    if (/^(?:import|from|def|class|for|while|if|elif|else|try|except|finally|with|return|print|assert|raise|yield|global|nonlocal|del|pass|break|continue|async|await|lambda|@)/.test(s)) return 'code';
+    /* 英文句子式说明："Use a stack to match parentheses." */
+    if (/^[A-Z][a-z]+(?:\s+[a-z]+){2,}[.:]/.test(s)) return 'prose';
+    if (/^(?:here|sure|certainly|this|note|you|we|it|the|below|above|that|let)\b/i.test(s)) return 'prose';
+    /* 非字符串部分含中文：带运算/括号的算代码，否则算说明 */
+    const bare = s.replace(/(['"])(?:\\.|(?!\1)[^\\])*\1/g, '');
+    if (/[\u4e00-\u9fa5]/.test(bare)) return /[=(){}\[\]]/.test(s) ? 'code' : 'prose';
+    if (/[=(){}\[\]]|:\s*$/.test(s)) return 'code';
+    if (/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\(.*\))?$/.test(s)) return 'code';
+    if (/[。；！？]$/.test(s)) return 'prose';
+    return 'prose';
   }
 
-  function isProse(t) {
-    if (!t) return false;
-    if (/^#/.test(t)) return false;                                  // 注释永远保留
-    if (/[=(){}\[\]+*/%]|^\s*(?:import|from|def|class|for|while|if|elif|else|try|except|with|return|print|assert|raise)\b/.test(t)) return false;
-    if (/[\u4e00-\u9fa5]/.test(t) && !/["']/.test(t)) return true;    // 中文且不在字符串里 → 说明文字
-    if (/[。！？]\s*$/.test(t)) return true;
-    if (/^(?:Here|Sure|This|Note|You|We|It|The|Below|Above|That)\b/i.test(t)) return true;
-    return false;
+  /* 全角标点会让 Python 直接 SyntaxError。注释行不动（里面本来就是中文） */
+  const FULL = {
+    '：': ':', '，': ',', '（': '(', '）': ')', '【': '[', '】': ']', '｛': '{', '｝': '}',
+    '；': ';', '！': '!', '？': '?', '“': '"', '”': '"', '‘': "'", '’': "'",
+    '＝': '=', '＃': '#', '　': ' '
+  };
+  function fixPunct(line) {
+    if (/^\s*#/.test(line)) return line;
+    const bare = line.replace(/(['"])(?:\\.|(?!\1)[^\\])*\1/g, '');
+    if (/[\u4e00-\u9fa5]/.test(bare)) return line;
+    return line.replace(/[：，（）【】｛｝；！？“”‘’＝＃　]/g, c => FULL[c] || c);
   }
 
-  function makeCodeFilter(out) {
-    let raw = '';
-    let mode = 'head';
-    let buf = '';
-    const TAIL = 20;
-    return {
-      push(chunk) {
-        if (mode === 'done') return;
-        raw += chunk;
-        if (mode === 'head') {
-          const at = findCodeStart(raw);
-          if (at >= 0) { mode = 'code'; buf = raw.slice(at); }
-          else if (raw.length > 400) { mode = 'code'; buf = raw; }
-          else return;
-        } else {
-          /* 已经在代码模式：新来的块必须接上，否则只剩切换那一刻的快照 */
-          buf += chunk;
-        }
-        if (mode !== 'code') return;
-        const end = buf.indexOf('```');
-        if (end >= 0) { if (end) out(buf.slice(0, end)); mode = 'done'; buf = ''; return; }
-        if (buf.length > TAIL) { out(buf.slice(0, buf.length - TAIL)); buf = buf.slice(-TAIL); }
-      },
-      finish() {
-        if (mode === 'code' && buf) {
-          let s = buf.replace(/\r?\n?```[\s\S]*$/, '');
-          const lines = s.split('\n');
-          /* 结尾若跟着 agent 的说明文字，切掉 */
-          while (lines.length) {
-            const t = lines[lines.length - 1].trim();
-            if (!t) { lines.pop(); continue; }
-            if (isProse(t)) { lines.pop(); continue; }
-            break;
-          }
-          s = lines.join('\n').replace(/^\s*\n+/, '');
-          if (s) out(s);
-        }
-        buf = '';
-      }
-    };
+  function extractCode(raw) {
+    const s = norm(raw || '');
+    if (!s.trim()) return '';
+
+    /* 1) 有围栏就用围栏里那一块，最可靠 */
+    let body = s;
+    const fm = /```[a-zA-Z0-9_+#-]*[ \t]*\r?\n([\s\S]*?)(?:\r?\n[ \t]*```|$)/.exec(s);
+    if (fm && fm[1] && fm[1].trim()) {
+      body = fm[1];
+    } else if (/^```/.test(s.trim())) {
+      body = s.replace(/^```[a-zA-Z0-9_+#-]*[ \t]*\r?\n?/, '');
+    }
+
+    const lines = body.split('\n');
+    const kind = lines.map(classify);
+
+    let first = -1, last = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (kind[i] === 'code' || kind[i] === 'comment') { first = i; break; }
+    }
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (kind[i] === 'code' || kind[i] === 'comment') { last = i; break; }
+    }
+    if (first < 0 || last < first) return '';
+
+    /* 开头若紧邻中文说明性注释块，一并带上（那本来就是给代码写的注释） */
+    while (first > 0 && kind[first - 1] === 'comment') first--;
+
+    const keep = [];
+    for (let i = first; i <= last; i++) {
+      if (kind[i] === 'prose' || kind[i] === 'fence') { dbg('drop L' + (i + 1)); continue; }
+      keep.push(lines[i]);
+    }
+
+    let code = keep.join('\n').replace(/[ \t]+$/, '').replace(/\s+$/, '');
+
+    /* 整段被统一缩进（模型常见）会直接 IndentationError，减掉公共缩进 */
+    let min = Infinity;
+    code.split('\n').forEach(l => {
+      if (!l.trim()) return;
+      const n = /^[ \t]*/.exec(l)[0].length;
+      if (n < min) min = n;
+    });
+    if (min > 0 && min < Infinity) {
+      code = code.split('\n').map(l => l.slice(Math.min(min, l.length))).join('\n');
+    }
+
+    code = code.split('\n').map(fixPunct).join('\n');
+    code = code.replace(/^\s*\n+/, '').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '');
+    return code;
   }
 
   /* 公网隧道地址会变，所以每次开工前从站点根目录的 bridge.json 取一次 */
@@ -601,41 +534,34 @@
     busy = true;
     dbg('run');
 
-    const T = { text: '', done: false, err: null };
-    const filter = makeCodeFilter(s => { T.text += s; });
-
-    /* 尽早拿到编辑器，让光标先出现在 cell 里 */
-    let cm = null;
-    let typing = null;
-
     try {
-      cm = await acquireEditor();
-      if (!cm) throw new Error('no-editor');
-      typing = typeLoop(cm, T).catch(e => { T.err = e; });
+      /* 1) 先把整段回复收完，编辑器一点不动 */
+      let raw = '';
+      await streamCode(promptText, chunk => { raw += chunk; });
+      window.__icRaw = raw;
 
-      const p = streamCode(promptText, chunk => filter.push(chunk));
-      p.then(() => { filter.finish(); T.done = true; })
-       .catch(e => { T.err = e; T.done = true; });
-
-      await Promise.all([p.catch(() => {}), typing]);
-
-      if (T.err) throw T.err;
-
-      /* 对账：忽略缩进差异，只核对真正的字符有没有丢 */
-      const got = pack(norm(cm.innerText || ''));
-      const want = pack(T.text);
-      if (got !== want) {
-        dbg('repair ' + got.length + '->' + want.length);
-        repairCell(cm, T.text);
+      /* 2) 一次性切成干净代码 */
+      const code = extractCode(raw);
+      if (!code) {
+        const e = new Error('没认出代码');
+        e.code = 'nocode';
+        throw e;
       }
-      dbg('done ' + got.length + '/' + want.length + (T.suspect ? ' (suspect)' : ''));
-      window.__icLast = { text: T.text, cell: norm(cm.innerText || '') };
-      return T.text;
+
+      /* 3) 一次性写进一个干净的新单元格 */
+      const cm = await acquireFreshCell();
+      if (!cm) throw new Error('no-editor');
+      await sleep(40);
+      pasteCode(cm, code);
+
+      dbg('done ' + code.length + 'ch');
+      window.__icLast = { text: code, cell: norm(cm.innerText || '') };
+      return code;
     } catch (err) {
       busy = false; /* 先释放，否则无法唤起输入条 */
-      const code = err && err.code;
+      const c = err && err.code;
       dbg('err ' + (err && err.message ? err.message : String(err)));
-      if (code === 'nokey') { pendingText = promptText; askKey(); }
+      if (c === 'nokey') { pendingText = promptText; askKey(); }
       else { toast(err && err.message ? err.message : '生成失败'); }
       return null;
     } finally {
