@@ -15,7 +15,7 @@
       api: 'https://api.siliconflow.cn/v1/chat/completions',
       model: 'deepseek-ai/DeepSeek-V4-Flash',
       // 依次尝试：固定网关优先，客户端临时口作为兜底。连不上就继续往下试。
-      acp: ['http://127.0.0.1:8799', 'http://127.0.0.1:1894'],
+      acp: ['http://127.0.0.1:8799'],
       // 若显式给了自建端点（本地开发用），则走该端点
       endpoint: ''
     },
@@ -218,96 +218,55 @@
     };
   }
 
-  /* 走本机 WorkBuddy 网关：请求会被排进当前那个对话，由真 agent 处理 */
+  /* 走本机桥接（bridge.py）：由它绑到专用会话，逐字吐文本回来 */
   async function streamViaACP(promptText, onDelta, base) {
     base = base.replace(/\/+$/, '');
-    const hdr = { 'Content-Type': 'application/json' };
-
-    /* 端口没开就立刻失败，别让主人干等 */
-    const guard = ms => {
-      const c = new AbortController();
-      const t = setTimeout(() => c.abort(), ms);
-      return { signal: c.signal, done: () => clearTimeout(t) };
-    };
-
-    const g0 = guard(1200);
-    let cr;
-    try {
-      cr = await fetch(base + '/api/v1/acp/connect', { method: 'POST', headers: hdr, body: '{}', signal: g0.signal });
-    } finally {
-      g0.done();
-    }
-    if (!cr.ok) throw new Error('acp connect ' + cr.status);
-    const conn = await cr.json();
-
-    const H = Object.assign({}, hdr, {
-      Accept: 'application/json, text/event-stream',
-      'acp-connection-id': conn.connectionId,
-      'acp-session-token': conn.sessionToken
-    });
-
-    let seq = 0;
-    const rpc = (method, params, signal) => fetch(base + '/api/v1/acp', {
-      method: 'POST',
-      headers: H,
-      signal,
-      body: JSON.stringify({ jsonrpc: '2.0', id: ++seq, method, params })
-    });
-
-    const g1 = guard(8000);
-    try {
-      await rpc('initialize', { protocolVersion: 1, clientCapabilities: {} }, g1.signal);
-    } finally {
-      g1.done();
-    }
-
-    const g2 = guard(8000);
-    let nr;
-    try {
-      nr = await rpc('session/new', { cwd: '.', mcpServers: [] }, g2.signal);
-    } finally {
-      g2.done();
-    }
-    let sid = null;
-    for (const m of parseRpcBlob(await nr.text())) {
-      if (m.result && m.result.sessionId) sid = m.result.sessionId;
-    }
-    if (!sid) throw new Error('acp no session');
-
     const instr = '只输出可以直接运行的 Python 代码，不要任何解释，不要用 ``` 包裹。需求：' + promptText;
 
-    /* 会话被占用时会一直挂着，所以给一个空闲上限自己收手 */
     const ac = new AbortController();
-    const IDLE = 20000;
-    let idle = setTimeout(() => ac.abort(), IDLE);
-    const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), IDLE); };
+    let idle = setTimeout(() => ac.abort(), 45000);   // 首包上限
+    const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), 120000); };
 
-    let settled = false;
     let got = 0;
-    const emit = t => { if (t) { got += t.length; onDelta(t); } };
     try {
-      const pr = await rpc('session/prompt', {
-        sessionId: sid,
-        prompt: [{ type: 'text', text: instr }]
-      }, ac.signal);
-      if (!pr.ok) throw new Error('acp prompt ' + pr.status);
-
-      await readSSE(pr, m => {
-        bump();
-        if (m.method === 'session/update') {
-          const u = (m.params && m.params.update) || {};
-          if (u.sessionUpdate !== 'agent_message_chunk') return;
-          const c = u.content || {};
-          if (c.type === 'text' && c.text) emit(c.text);
-          else if (c.content && c.content.type === 'text' && c.content.text) emit(c.content.text);
-        } else if (m.result || m.error) {
-          settled = true;
-          if (m.result && m.result.stopReason) dbg('acp stop ' + m.result.stopReason);
-        }
+      const r = await fetch(base + '/gen', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: instr }),
+        signal: ac.signal
       });
+      if (!r.ok) throw new Error('gen ' + r.status);
+
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let cut;
+        while ((cut = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, cut);
+          buf = buf.slice(cut + 2);
+          for (const line of block.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            let m;
+            try { m = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+            if (m.delta) { bump(); got += m.delta.length; onDelta(m.delta); }
+            else if (m.error) {
+              if (!got) {
+                const e = new Error('gen ' + m.error);
+                e.code = 'bridge';
+                throw e;
+              }
+              dbg('gen error ' + m.error);
+            }
+          }
+        }
+      }
     } catch (e) {
       if (e && e.name === 'AbortError') {
-        const busy = new Error('acp busy');
+        const busy = new Error('gen busy');
         busy.code = 'busy';
         throw busy;
       }
@@ -315,10 +274,8 @@
     } finally {
       clearTimeout(idle);
     }
-    if (!settled) dbg('acp stream ended without result');
-    /* 一个字都没吐出来，通常是被拒或未登录，交给上层回退 */
     if (!got) {
-      const e = new Error('acp empty');
+      const e = new Error('gen empty');
       e.code = 'empty';
       throw e;
     }
