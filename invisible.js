@@ -205,6 +205,9 @@
             mode = 'code'; buf = raw;
           } else if (raw.length > 300) { mode = 'code'; buf = raw; }
           else return;
+        } else {
+          /* 已经在代码模式：新来的块必须接上，否则只剩切换那一刻的快照 */
+          buf += chunk;
         }
         if (mode !== 'code') return;
         const end = buf.indexOf('```');
@@ -228,6 +231,7 @@
     const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), 120000); };
 
     let got = 0;
+    let chunkN = 0, deltaN = 0, head = '';
     try {
       const r = await fetch(base + '/gen', {
         method: 'POST',
@@ -243,6 +247,7 @@
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
+        chunkN++;
         buf += dec.decode(value, { stream: true });
         let cut;
         while ((cut = buf.indexOf('\n\n')) >= 0) {
@@ -252,7 +257,7 @@
             if (!line.startsWith('data:')) continue;
             let m;
             try { m = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
-            if (m.delta) { bump(); got += m.delta.length; onDelta(m.delta); }
+            if (m.delta) { bump(); got += m.delta.length; deltaN++; if (head.length < 90) head += m.delta; onDelta(m.delta); }
             else if (m.error) {
               if (!got) {
                 const e = new Error('gen ' + m.error);
@@ -279,6 +284,7 @@
       e.code = 'empty';
       throw e;
     }
+    dbg('gen ' + chunkN + 'c/' + deltaN + 'd/' + got + 'ch');
   }
 
   async function streamCode(promptText, onDelta) {
