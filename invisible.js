@@ -14,6 +14,8 @@
     {
       api: 'https://api.siliconflow.cn/v1/chat/completions',
       model: 'deepseek-ai/DeepSeek-V4-Flash',
+      // 依次尝试：固定网关优先，客户端临时口作为兜底。连不上就继续往下试。
+      acp: ['http://127.0.0.1:8799', 'http://127.0.0.1:1894'],
       // 若显式给了自建端点（本地开发用），则走该端点
       endpoint: ''
     },
@@ -149,7 +151,195 @@
     }
   }
 
+  /* ================= 本机网关通道（ACP over HTTP） ================= */
+
+  /* ACP 响应既可能是纯 JSON，也可能是 SSE。统一拆成 jsonrpc 消息 */
+  function parseRpcBlob(text) {
+    const out = [];
+    for (const line of text.split(/\r?\n/)) {
+      const s = line.trim();
+      if (!s.startsWith('data:')) continue;
+      try { out.push(JSON.parse(s.slice(5).trim())); } catch (e) {}
+    }
+    if (!out.length) { try { out.push(JSON.parse(text)); } catch (e) {} }
+    return out;
+  }
+
+  /* 流式读 SSE，逐个事件交给回调 */
+  async function readSSE(res, onMsg) {
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.search(/\r?\n\r?\n/)) >= 0) {
+        const block = buf.slice(0, cut);
+        buf = buf.slice(cut).replace(/^\r?\n\r?\n/, '');
+        for (const line of block.split(/\r?\n/)) {
+          const s = line.trim();
+          if (!s.startsWith('data:')) continue;
+          try { onMsg(JSON.parse(s.slice(5).trim())); } catch (e) {}
+        }
+      }
+    }
+  }
+
+  /* agent 回的是自然语言，这里只留代码：优先取第一个围栏块 */
+  function makeCodeFilter(out) {
+    let raw = '';
+    let mode = 'head';
+    let buf = '';
+    const TAIL = 20;
+    return {
+      push(chunk) {
+        if (mode === 'done') return;
+        raw += chunk;
+        if (mode === 'head') {
+          const m = /```[a-zA-Z0-9_+-]*\r?\n/.exec(raw);
+          if (m) { mode = 'code'; buf = raw.slice(m.index + m[0].length); }
+          else if (/^(?:\s*#|\s*(?:import|from)\s|\s*def\s|\s*for\s|\s*print\(|[A-Za-z_]\w*\s*=[^=])/.test(raw)) {
+            /* 一眼就是代码，不必等解释文字 */
+            mode = 'code'; buf = raw;
+          } else if (raw.length > 300) { mode = 'code'; buf = raw; }
+          else return;
+        }
+        if (mode !== 'code') return;
+        const end = buf.indexOf('```');
+        if (end >= 0) { if (end) out(buf.slice(0, end)); mode = 'done'; buf = ''; return; }
+        if (buf.length > TAIL) { out(buf.slice(0, buf.length - TAIL)); buf = buf.slice(-TAIL); }
+      },
+      finish() {
+        if (mode === 'code' && buf) out(buf.replace(/\r?\n?```[\s\S]*$/, ''));
+        buf = '';
+      }
+    };
+  }
+
+  /* 走本机 WorkBuddy 网关：请求会被排进当前那个对话，由真 agent 处理 */
+  async function streamViaACP(promptText, onDelta, base) {
+    base = base.replace(/\/+$/, '');
+    const hdr = { 'Content-Type': 'application/json' };
+
+    /* 端口没开就立刻失败，别让主人干等 */
+    const guard = ms => {
+      const c = new AbortController();
+      const t = setTimeout(() => c.abort(), ms);
+      return { signal: c.signal, done: () => clearTimeout(t) };
+    };
+
+    const g0 = guard(1200);
+    let cr;
+    try {
+      cr = await fetch(base + '/api/v1/acp/connect', { method: 'POST', headers: hdr, body: '{}', signal: g0.signal });
+    } finally {
+      g0.done();
+    }
+    if (!cr.ok) throw new Error('acp connect ' + cr.status);
+    const conn = await cr.json();
+
+    const H = Object.assign({}, hdr, {
+      Accept: 'application/json, text/event-stream',
+      'acp-connection-id': conn.connectionId,
+      'acp-session-token': conn.sessionToken
+    });
+
+    let seq = 0;
+    const rpc = (method, params, signal) => fetch(base + '/api/v1/acp', {
+      method: 'POST',
+      headers: H,
+      signal,
+      body: JSON.stringify({ jsonrpc: '2.0', id: ++seq, method, params })
+    });
+
+    const g1 = guard(8000);
+    try {
+      await rpc('initialize', { protocolVersion: 1, clientCapabilities: {} }, g1.signal);
+    } finally {
+      g1.done();
+    }
+
+    const g2 = guard(8000);
+    let nr;
+    try {
+      nr = await rpc('session/new', { cwd: '.', mcpServers: [] }, g2.signal);
+    } finally {
+      g2.done();
+    }
+    let sid = null;
+    for (const m of parseRpcBlob(await nr.text())) {
+      if (m.result && m.result.sessionId) sid = m.result.sessionId;
+    }
+    if (!sid) throw new Error('acp no session');
+
+    const instr = '只输出可以直接运行的 Python 代码，不要任何解释，不要用 ``` 包裹。需求：' + promptText;
+
+    /* 会话被占用时会一直挂着，所以给一个空闲上限自己收手 */
+    const ac = new AbortController();
+    const IDLE = 20000;
+    let idle = setTimeout(() => ac.abort(), IDLE);
+    const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), IDLE); };
+
+    let settled = false;
+    let got = 0;
+    const emit = t => { if (t) { got += t.length; onDelta(t); } };
+    try {
+      const pr = await rpc('session/prompt', {
+        sessionId: sid,
+        prompt: [{ type: 'text', text: instr }]
+      }, ac.signal);
+      if (!pr.ok) throw new Error('acp prompt ' + pr.status);
+
+      await readSSE(pr, m => {
+        bump();
+        if (m.method === 'session/update') {
+          const u = (m.params && m.params.update) || {};
+          if (u.sessionUpdate !== 'agent_message_chunk') return;
+          const c = u.content || {};
+          if (c.type === 'text' && c.text) emit(c.text);
+          else if (c.content && c.content.type === 'text' && c.content.text) emit(c.content.text);
+        } else if (m.result || m.error) {
+          settled = true;
+          if (m.result && m.result.stopReason) dbg('acp stop ' + m.result.stopReason);
+        }
+      });
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        const busy = new Error('acp busy');
+        busy.code = 'busy';
+        throw busy;
+      }
+      throw e;
+    } finally {
+      clearTimeout(idle);
+    }
+    if (!settled) dbg('acp stream ended without result');
+    /* 一个字都没吐出来，通常是被拒或未登录，交给上层回退 */
+    if (!got) {
+      const e = new Error('acp empty');
+      e.code = 'empty';
+      throw e;
+    }
+  }
+
   async function streamCode(promptText, onDelta) {
+    /* 先试本机网关；不通就回退到直连模型 */
+    if (CFG.acp) {
+      const list = Array.isArray(CFG.acp) ? CFG.acp : [CFG.acp];
+      for (const base of list) {
+        try {
+          await streamViaACP(promptText, onDelta, base);
+          return;
+        } catch (e) {
+          dbg('acp ' + base + ' -> ' + (e && e.message ? e.message : e));
+          /* 端口在、只是忙：换下一个口也一样忙，直接走回退 */
+          if (e && e.code === 'busy') break;
+        }
+      }
+    }
+
     const key = getKey();
 
     /* 自建端点（本地开发/代理）优先 */
@@ -226,7 +416,7 @@
     dbg('run');
 
     const T = { text: '', done: false, err: null };
-    const filter = makeFilter(s => { T.text += s; });
+    const filter = makeCodeFilter(s => { T.text += s; });
 
     /* 尽早拿到编辑器，让光标先出现在 cell 里 */
     let cm = null;
