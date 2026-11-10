@@ -1,0 +1,29 @@
+{
+  "content": [
+    {
+      "content": null,
+      "created": "2026-11-10T06:13:26.336694Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-11-10T06:13:22.079354Z",
+      "mimetype": null,
+      "name": "Untitled3.ipynb",
+      "path": "Untitled3.ipynb",
+      "size": 589,
+      "type": "notebook",
+      "writable": true
+    }
+  ],
+  "created": "2026-11-10T06:13:26.336694Z",
+  "format": "json",
+  "hash": null,
+  "hash_algorithm": null,
+  "last_modified": "2026-11-10T06:13:26.336694Z",
+  "mimetype": null,
+  "name": "",
+  "path": "",
+  "size": null,
+  "type": "directory",
+  "writable": true
+}

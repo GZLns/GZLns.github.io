@@ -1,0 +1,434 @@
+/* invisible-coder : 真实 Jupyter 前端上的隐形生成入口
+ *
+ * 设计原则
+ *   1. 不修改任何 Jupyter 样式，不新增任何可见控件
+ *   2. 只操作真实编辑器 DOM（等价于人在单元格里打字），因此排版/高亮/换行
+ *      全部由 Jupyter 自己渲染，与手写内容没有任何区别
+ *   3. 纯静态：浏览器直连模型 API，不需要任何本地或云端后端
+ *   4. key 只存在使用者本机的 localStorage，不进页面、不上传第三方
+ */
+(function () {
+  'use strict';
+
+  const CFG = Object.assign(
+    {
+      api: 'https://api.siliconflow.cn/v1/chat/completions',
+      model: 'deepseek-ai/DeepSeek-V4-Flash',
+      // 若显式给了自建端点（本地开发用），则走该端点
+      endpoint: ''
+    },
+    window.__INVISIBLE_CODER__ || {}
+  );
+
+  const LS_KEY = 'ic.key';
+  const LS_MODEL = 'ic.model';
+
+  const SYSTEM = [
+    '你在一个 Jupyter notebook 的代码单元里工作。用户用中文描述需求，你输出可以直接运行的 Python 代码。',
+    '',
+    '要求：',
+    '1. 只输出代码本身。不要解释，不要 markdown 代码块标记，不要 ``` 包裹。',
+    '2. 风格贴合交互式 notebook：前面的单元已经加载了 pandas / numpy，变量名沿用 df。',
+    '3. 每个逻辑段落前用一行中文注释说明意图。',
+    '4. 最后一行写成一个表达式（不要 print），让 notebook 直接显示结果。',
+    '5. 只用 pandas、numpy、matplotlib、scipy 这类常装库，不要引入其他依赖。',
+    '6. 代码长度控制在 5-25 行。'
+  ].join('\n');
+
+  const dbg = m => { try { document.title = 'IC·' + m; } catch (e) {} };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const getKey = () => { try { return localStorage.getItem(LS_KEY) || ''; } catch (e) { return ''; } };
+  const setKey = k => { try { k ? localStorage.setItem(LS_KEY, k) : localStorage.removeItem(LS_KEY); } catch (e) {} };
+  const getModel = () => { try { return localStorage.getItem(LS_MODEL) || CFG.model; } catch (e) { return CFG.model; } };
+
+  /* ================= DOM 定位 ================= */
+
+  const nbEl = () => document.querySelector('.jp-Notebook');
+
+  function cellEmpty(cell) {
+    const cm = cell && cell.querySelector('.cm-content');
+    if (!cm) return false;
+    return (cm.textContent || '').replace(/\u200b/g, '').trim() === '';
+  }
+
+  function clickInsertBelow() {
+    const wanted = 'insert a cell below';
+    const btn = [...document.querySelectorAll('button')].find(b => {
+      const t = ((b.title || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+      return t.includes(wanted);
+    });
+    if (btn) { btn.click(); return true; }
+    const footer = document.querySelector('.jp-Notebook-footer');
+    if (footer) { footer.click(); return true; }
+    return false;
+  }
+
+  async function acquireEditor() {
+    const nb = nbEl();
+    if (!nb) return null;
+    const active = nb.querySelector('.jp-Cell.jp-mod-active');
+    if (active && cellEmpty(active)) return active.querySelector('.cm-content');
+    if (clickInsertBelow()) await sleep(180);
+    const cells = nb.querySelectorAll('.jp-Cell');
+    const last = cells[cells.length - 1];
+    return last ? last.querySelector('.cm-content') : null;
+  }
+
+  /* ================= 流式生成 ================= */
+
+  /* 围栏过滤器：模型偶尔仍会加 ``` 包裹。为了做到流式，
+     头部先缓冲到能判定，尾部保留 20 字符直到结束再收尾。 */
+  function makeFilter(out) {
+    let head = '';
+    let started = false;
+    let buf = '';
+    const TAIL = 20;
+
+    function emit(s) {
+      if (!s) return;
+      buf += s;
+      if (buf.length > TAIL) {
+        out(buf.slice(0, buf.length - TAIL));
+        buf = buf.slice(buf.length - TAIL);
+      }
+    }
+
+    return {
+      push(chunk) {
+        if (!started) {
+          head += chunk;
+          if (head.length < 4 && head.indexOf('\n') === -1) return;
+          const m = /^```[a-zA-Z0-9_-]*\r?\n/.exec(head);
+          started = true;
+          if (m) head = head.slice(m[0].length);
+          else if (/^```/.test(head)) head = head.replace(/^```[a-zA-Z0-9_-]*/, '');
+        } else {
+          head += chunk;
+        }
+        const keep = started ? head : '';
+        if (!keep) return;
+        head = '';
+        emit(keep);
+      },
+      finish() {
+        let rest = buf;
+        if (head) rest = (rest || '') + head;
+        rest = rest.replace(/\r?\n?```\s*$/, '');
+        rest = rest.replace(/^\s*\n+/, '');
+        buf = '';
+        if (rest) out(rest);
+      }
+    };
+  }
+
+  /* 打字器：从队列消费，走浏览器真实输入管线 */
+  async function typeLoop(cm, T) {
+    cm.focus();
+    let idx = 0;
+    let idle = 0;
+    while (true) {
+      if (T.err) throw T.err;
+      const remain = T.text.length - idx;
+      if (remain > 0) {
+        const step = remain > 800 ? 8 : remain > 300 ? 3 : 1;
+        document.execCommand('insertText', false, T.text.slice(idx, idx + step));
+        idx += step;
+        idle = 0;
+        await sleep(7 + Math.random() * 9);
+        continue;
+      }
+      if (T.done) break;
+      if (++idle > 400) break; // 20s 无数据，放弃
+      await sleep(50);
+    }
+  }
+
+  async function streamCode(promptText, onDelta) {
+    const key = getKey();
+
+    /* 自建端点（本地开发/代理）优先 */
+    if (CFG.endpoint) {
+      const r = await fetch(CFG.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: promptText })
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      if (d.code) onDelta(d.code);
+      return;
+    }
+
+    if (!key) { const e = new Error('nokey'); e.code = 'nokey'; throw e; }
+
+    const res = await fetch(CFG.api, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + key
+      },
+      body: JSON.stringify({
+        model: getModel(),
+        stream: true,
+        temperature: 0.35,
+        max_tokens: 1500,
+        messages: [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: promptText }
+        ]
+      })
+    });
+
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); if (j.message) msg += ' ' + j.message; } catch (e) {}
+      const err = new Error(msg);
+      if (res.status === 401 || res.status === 403) err.code = 'nokey';
+      throw err;
+    }
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let carry = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      carry += dec.decode(value, { stream: true });
+      const lines = carry.split('\n');
+      carry = lines.pop();
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s || s === 'data: [DONE]') continue;
+        if (!s.startsWith('data:')) continue;
+        try {
+          const j = JSON.parse(s.slice(5).trim());
+          const d = j.choices && j.choices[0] && j.choices[0].delta;
+          if (d && d.content) onDelta(d.content);
+        } catch (e) {}
+      }
+    }
+  }
+
+  /* ================= 主流程 ================= */
+
+  let busy = false;
+
+  async function run(promptText) {
+    if (busy) return null;
+    busy = true;
+    dbg('run');
+
+    const T = { text: '', done: false, err: null };
+    const filter = makeFilter(s => { T.text += s; });
+
+    /* 尽早拿到编辑器，让光标先出现在 cell 里 */
+    let cm = null;
+    let typing = null;
+
+    try {
+      cm = await acquireEditor();
+      if (!cm) throw new Error('no-editor');
+      typing = typeLoop(cm, T).catch(e => { T.err = e; });
+
+      const p = streamCode(promptText, chunk => filter.push(chunk));
+      p.then(() => { filter.finish(); T.done = true; })
+       .catch(e => { T.err = e; T.done = true; });
+
+      await Promise.all([p.catch(() => {}), typing]);
+
+      if (T.err) throw T.err;
+
+      const got = (cm.textContent || '').replace(/\u200b/g, '').length;
+      dbg('done ' + got + '/' + T.text.length);
+      return T.text;
+    } catch (err) {
+      busy = false; /* 先释放，否则无法唤起输入条 */
+      const code = err && err.code;
+      dbg('err ' + (err && err.message ? err.message : String(err)));
+      if (code === 'nokey') { askKey(); }
+      else { toast(err && err.message ? err.message : '生成失败'); }
+      return null;
+    } finally {
+      busy = false;
+    }
+  }
+
+  /* ================= 极简交互层 ================= */
+
+  const CSS = `
+  /* ---- 品牌对齐：左上角换成 Jupyter 官方图标与文字 ---- */
+  #jp-NotebookLogo > svg{display:none !important}
+  #jp-NotebookLogo{display:inline-flex !important;align-items:center;gap:5px;padding-left:5px}
+  #jp-NotebookLogo::before{content:'';flex:none;width:19px;height:22px;
+    background:url(../jupyter-logo.svg) no-repeat center/contain}
+  #jp-NotebookLogo::after{content:'jupyter';font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;
+    font-size:17px;font-weight:400;color:#4E4E4E;letter-spacing:.2px;line-height:1}
+  /* Lite 没有签名信任机制，不显示一个并不成立的状态 */
+  .jp-NotebookTrustedStatus{display:none !important}
+  /* ---- 入口 ---- */
+  #ic-trigger{position:fixed;right:0;bottom:0;width:56px;height:56px;z-index:99998;cursor:default;
+    opacity:0;transition:opacity .3s ease}
+  #ic-trigger:hover{opacity:1}
+  #ic-trigger::after{content:'';position:absolute;right:18px;bottom:18px;width:6px;height:6px;
+    border-radius:50%;background:#bdbdbd;transition:all .25s ease}
+  #ic-trigger:hover::after{background:#1976d2;box-shadow:0 0 7px rgba(25,118,210,.45)}
+  #ic-bar{position:fixed;left:0;right:0;bottom:0;z-index:99999;height:38px;display:flex;
+    align-items:center;gap:10px;padding:0 16px;background:#fff;border-top:1px solid #e0e0e0;
+    box-shadow:0 -2px 6px rgba(0,0,0,.06);transform:translateY(101%);
+    transition:transform .17s cubic-bezier(.4,0,.2,1);
+    font-family:system-ui,-apple-system,'Segoe UI',sans-serif}
+  #ic-bar.open{transform:translateY(0)}
+  #ic-in{flex:1 1 auto;background:transparent;border:0;outline:0;color:rgba(0,0,0,.87);
+    font-family:menlo,consolas,'DejaVu Sans Mono',monospace;font-size:13px}
+  #ic-in::placeholder{color:rgba(0,0,0,.26)}
+  #ic-hint{font-size:11px;color:rgba(0,0,0,.26);font-family:system-ui,sans-serif;
+    user-select:none;white-space:nowrap}
+  #ic-toast{position:fixed;left:50%;bottom:56px;transform:translateX(-50%) translateY(6px);
+    z-index:99999;padding:5px 12px;border-radius:3px;background:rgba(0,0,0,.72);color:#fff;
+    font-family:system-ui,sans-serif;font-size:11.5px;opacity:0;pointer-events:none;
+    transition:opacity .22s ease,transform .22s ease}
+  #ic-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  `;
+
+  let mounted = false;
+  let ui = {};
+
+  function toast(msg) {
+    if (!ui.toast) return;
+    ui.toast.textContent = msg;
+    ui.toast.classList.add('show');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => ui.toast.classList.remove('show'), 2600);
+  }
+
+  function askKey() {
+    ui.mode = 'key';
+    ui.input.value = '';
+    ui.input.type = 'password';
+    ui.input.placeholder = '粘贴 SiliconFlow API Key，回车保存到本机';
+    ui.hint.textContent = 'local only';
+    open();
+  }
+
+  function taskMode() {
+    ui.mode = 'task';
+    ui.input.type = 'text';
+    ui.input.value = '';
+    ui.input.placeholder = '…';
+    ui.hint.textContent = 'enter';
+  }
+
+  function open() {
+    if (busy) return;
+    ui.bar.classList.add('open');
+    ui.input.focus();
+  }
+
+  function close() {
+    ui.bar.classList.remove('open');
+    ui.input.value = '';
+    ui.input.blur();
+  }
+
+  function mountUI() {
+    if (mounted) return;
+    mounted = true;
+
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    document.head.appendChild(style);
+
+    const trigger = document.createElement('div');
+    trigger.id = 'ic-trigger';
+
+    const bar = document.createElement('div');
+    bar.id = 'ic-bar';
+    bar.innerHTML = '<input id="ic-in" autocomplete="off" spellcheck="false" placeholder="…">' +
+                    '<span id="ic-hint">enter</span>';
+
+    const to = document.createElement('div');
+    to.id = 'ic-toast';
+
+    document.body.appendChild(trigger);
+    document.body.appendChild(bar);
+    document.body.appendChild(to);
+
+    ui = {
+      trigger,
+      bar,
+      toast: to,
+      input: bar.querySelector('#ic-in'),
+      hint: bar.querySelector('#ic-hint'),
+      mode: 'task'
+    };
+
+    taskMode();
+
+    trigger.addEventListener('click', () => {
+      if (!getKey()) askKey(); else { taskMode(); open(); }
+    });
+
+    document.addEventListener('keydown', e => {
+      if (!(e.ctrlKey && e.altKey)) return;
+      const k = (e.key || '').toLowerCase();
+      if (k === 'k') {
+        e.preventDefault();
+        if (!getKey()) askKey(); else { taskMode(); open(); }
+      } else if (k === 'l') {
+        e.preventDefault();
+        askKey();
+      }
+    });
+
+    ui.input.addEventListener('keydown', e => {
+      if (e.key === 'Escape') return close();
+      if (e.key !== 'Enter') return;
+      const text = ui.input.value.trim();
+      if (!text) return close();
+
+      if (ui.mode === 'key') {
+        setKey(text);
+        close();
+        taskMode();
+        toast('已保存在本机');
+        return;
+      }
+      close();
+      run(text);
+    });
+
+    window.invisibleCoder = {
+      open: () => { taskMode(); open(); },
+      close,
+      run,
+      resetKey: () => { setKey(''); toast('已清除本机 key'); }
+    };
+
+    /* 内核名：保留真实技术栈，只对齐 "Python 3 (…)" 的写法 */
+    const fixKernel = () => {
+      document.querySelectorAll('.jp-ToolbarButtonComponent-label').forEach(el => {
+        const t = (el.textContent || '').trim();
+        if (/^Python \(/.test(t)) el.textContent = 'Python 3 (Pyodide)';
+      });
+    };
+    fixKernel();
+    let brandTick = null;
+    new MutationObserver(() => {
+      if (brandTick) return;
+      brandTick = setTimeout(() => { brandTick = null; fixKernel(); }, 400);
+    }).observe(document.body, { childList: true, subtree: true });
+
+    dbg('mounted');
+
+    /* 开发自测：?ictest=<需求> */
+    const t = new URLSearchParams(location.search).get('ictest');
+    if (t) setTimeout(() => run(t), 1500);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mountUI);
+  } else {
+    mountUI();
+  }
+})();
