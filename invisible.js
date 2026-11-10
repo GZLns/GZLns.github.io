@@ -431,7 +431,7 @@
       busy = false; /* 先释放，否则无法唤起输入条 */
       const code = err && err.code;
       dbg('err ' + (err && err.message ? err.message : String(err)));
-      if (code === 'nokey') { askKey(); }
+      if (code === 'nokey') { pendingText = promptText; askKey(); }
       else { toast(err && err.message ? err.message : '生成失败'); }
       return null;
     } finally {
@@ -489,11 +489,13 @@
     toast._t = setTimeout(() => ui.toast.classList.remove('show'), 2600);
   }
 
+  let pendingText = '';
+
   function askKey() {
     ui.mode = 'key';
     ui.input.value = '';
     ui.input.type = 'password';
-    ui.input.placeholder = '粘贴 SiliconFlow API Key，回车保存到本机';
+    ui.input.placeholder = '桥没连上，走模型兜底需要 SiliconFlow Key（回车保存）';
     ui.hint.textContent = 'local only';
     open();
   }
@@ -552,16 +554,15 @@
 
     taskMode();
 
-    trigger.addEventListener('click', () => {
-      if (!getKey()) askKey(); else { taskMode(); open(); }
-    });
+    /* 主入口不问 key：桥通了就不需要 key，只有真的回退到模型时才问 */
+    trigger.addEventListener('click', () => { taskMode(); open(); });
 
     document.addEventListener('keydown', e => {
       if (!(e.ctrlKey && e.altKey)) return;
       const k = (e.key || '').toLowerCase();
       if (k === 'k') {
         e.preventDefault();
-        if (!getKey()) askKey(); else { taskMode(); open(); }
+        taskMode(); open();
       } else if (k === 'l') {
         e.preventDefault();
         askKey();
@@ -579,6 +580,10 @@
         close();
         taskMode();
         toast('已保存在本机');
+        /* 如果是刚才因为缺 key 中断的任务，补跑一次 */
+        const p = pendingText;
+        pendingText = '';
+        if (p) run(p);
         return;
       }
       close();
@@ -631,6 +636,9 @@
     watchTitle();
 
     dbg('mounted');
+
+    /* 提前把隧道地址捞到手，第一次按 Ctrl+Alt+K 时不用等 */
+    try { ensureDiscovered(); } catch (e) {}
 
     /* 开发自测：?ictest=<需求> */
     const t = new URLSearchParams(location.search).get('ictest');
