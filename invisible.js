@@ -182,7 +182,7 @@
     const s = (t || '').trim();
     if (!s) return 'blank';
     if (/^```/.test(s)) return 'fence';
-    if (/^#/.test(s)) return 'comment';
+    if (/^[#＃]/.test(s)) return 'comment';
     if (/^(?:import|from|def|class|for|while|if|elif|else|try|except|finally|with|return|print|assert|raise|yield|global|nonlocal|del|pass|break|continue|async|await|lambda|@)/.test(s)) return 'code';
     /* 英文句子式说明："Use a stack to match parentheses." */
     if (/^[A-Z][a-z]+(?:\s+[a-z]+){2,}[.:]/.test(s)) return 'prose';
@@ -203,7 +203,7 @@
     '＝': '=', '＃': '#', '　': ' '
   };
   function fixPunct(line) {
-    if (/^\s*#/.test(line)) return line;
+    if (/^\s*[#＃]/.test(line)) return line.replace(/^(\s*)＃/, '$1#');
     const bare = line.replace(/(['"])(?:\\.|(?!\1)[^\\])*\1/g, '');
     if (/[\u4e00-\u9fa5]/.test(bare)) return line;
     return line.replace(/[：，（）【】｛｝；！？“”‘’＝＃　]/g, c => FULL[c] || c);
