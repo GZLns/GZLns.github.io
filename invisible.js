@@ -35,7 +35,13 @@
     '6. 代码长度控制在 5-25 行。'
   ].join('\n');
 
-  const dbg = m => { try { document.title = 'IC·' + m; } catch (e) {} };
+  /* 诊断只进内存数组，绝不碰 document.title（否则标签页会露馅） */
+  const dbg = m => {
+    try {
+      (window.__icLog = window.__icLog || []).push(m);
+      if (window.__icDebug) console.log('[ic]', m);
+    } catch (e) {}
+  };
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const getKey = () => { try { return localStorage.getItem(LS_KEY) || ''; } catch (e) { return ''; } };
   const setKey = k => { try { k ? localStorage.setItem(LS_KEY, k) : localStorage.removeItem(LS_KEY); } catch (e) {} };
@@ -412,12 +418,28 @@
         if (/^Python \(/.test(t)) el.textContent = 'Python 3 (Pyodide)';
       });
     };
-    fixKernel();
+
+    /* 标签页标题：普通 notebook 显示的是一份本地文件的名字，不是发行版名 */
+    const fixTitle = () => {
+      const t = document.title || '';
+      if (!/JupyterLite/.test(t)) return;
+      const rest = t.replace(/JupyterLite/g, '').replace(/^[\s\-–—|·]+|[\s\-–—|·]+$/g, '');
+      document.title = rest || 'Untitled3';
+    };
+
+    fixKernel(); fixTitle();
     let brandTick = null;
     new MutationObserver(() => {
       if (brandTick) return;
-      brandTick = setTimeout(() => { brandTick = null; fixKernel(); }, 400);
+      brandTick = setTimeout(() => { brandTick = null; fixKernel(); fixTitle(); }, 400);
     }).observe(document.body, { childList: true, subtree: true });
+
+    /* <title> 节点被换掉时兜住 */
+    const watchTitle = () => {
+      const el = document.querySelector('title');
+      if (el) new MutationObserver(fixTitle).observe(el, { childList: true, characterData: true, subtree: true });
+    };
+    watchTitle();
 
     dbg('mounted');
 
