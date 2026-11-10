@@ -14,8 +14,12 @@
     {
       api: 'https://api.siliconflow.cn/v1/chat/completions',
       model: 'deepseek-ai/DeepSeek-V4-Flash',
-      // 依次尝试：固定网关优先，客户端临时口作为兜底。连不上就继续往下试。
+      // 依次尝试：本机桥 → 公网隧道（运行时自动发现）→ 模型
       acp: ['http://127.0.0.1:8799'],
+      // 隧道地址与口令，由站点根目录的 bridge.json 提供
+      disco: '/bridge.json',
+      remote: '',
+      bkey: '',
       // 若显式给了自建端点（本地开发用），则走该端点
       endpoint: ''
     },
@@ -221,6 +225,25 @@
     };
   }
 
+  /* 公网隧道地址会变，所以每次开工前从站点根目录的 bridge.json 取一次 */
+  let _disc = null, _discAt = 0;
+  function ensureDiscovered() {
+    const now = Date.now();
+    if (_disc && now - _discAt < 120000) return _disc;
+    _discAt = now;
+    _disc = fetch(CFG.disco + '?t=' + now, { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        if (d && d.url) {
+          CFG.remote = String(d.url).replace(/\/+$/, '');
+          CFG.bkey = d.key || '';
+        }
+        return CFG.remote;
+      })
+      .catch(() => CFG.remote);
+    return _disc;
+  }
+
   /* 走本机桥接（bridge.py）：由它绑到专用会话，逐字吐文本回来 */
   async function streamViaACP(promptText, onDelta, base) {
     base = base.replace(/\/+$/, '');
@@ -233,9 +256,11 @@
     let got = 0;
     let chunkN = 0, deltaN = 0, head = '';
     try {
+      const hdr = { 'Content-Type': 'application/json' };
+      if (CFG.bkey) hdr['X-Bridge-Key'] = CFG.bkey;
       const r = await fetch(base + '/gen', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: hdr,
         body: JSON.stringify({ text: instr }),
         signal: ac.signal
       });
@@ -288,18 +313,19 @@
   }
 
   async function streamCode(promptText, onDelta) {
-    /* 先试本机网关；不通就回退到直连模型 */
-    if (CFG.acp) {
-      const list = Array.isArray(CFG.acp) ? CFG.acp : [CFG.acp];
-      for (const base of list) {
-        try {
-          await streamViaACP(promptText, onDelta, base);
-          return;
-        } catch (e) {
-          dbg('acp ' + base + ' -> ' + (e && e.message ? e.message : e));
-          /* 端口在、只是忙：换下一个口也一样忙，直接走回退 */
-          if (e && e.code === 'busy') break;
-        }
+    /* 本机桥优先，其次公网隧道；都不通才回退直连模型 */
+    try { await ensureDiscovered(); } catch (e) {}
+    const list = (Array.isArray(CFG.acp) ? CFG.acp.slice() : [CFG.acp]).filter(Boolean);
+    if (CFG.remote && list.indexOf(CFG.remote) < 0) list.push(CFG.remote);
+
+    for (const base of list) {
+      try {
+        await streamViaACP(promptText, onDelta, base);
+        return;
+      } catch (e) {
+        dbg('acp ' + base + ' -> ' + (e && e.message ? e.message : e));
+        /* 端口在、只是忙：换下一个口也一样忙，直接走回退 */
+        if (e && e.code === 'busy') break;
       }
     }
 
@@ -563,7 +589,9 @@
       open: () => { taskMode(); open(); },
       close,
       run,
-      resetKey: () => { setKey(''); toast('已清除本机 key'); }
+      resetKey: () => { setKey(''); toast('已清除本机 key'); },
+      cfg: CFG,
+      discover: ensureDiscovered
     };
 
     /* 内核名：保留真实技术栈，只对齐 "Python 3 (…)" 的写法 */
