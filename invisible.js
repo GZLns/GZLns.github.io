@@ -133,6 +133,65 @@
     };
   }
 
+  const norm = s => (s || '').replace(/\u200b/g, '').replace(/\r/g, '');
+  const pack = s => (s || '').replace(/\s+/g, '');   // 忽略缩进，只比内容
+
+  /* 找到单元格的 CodeMirror 视图：绕开浏览器的括号自动补全与自动缩进 */
+  function cmViewOf(cm) {
+    const host = cm.closest('.cm-editor') || cm;
+    const content = host.querySelector('.cm-content') || cm;
+    const v = content && content.cmView && content.cmView.view;
+    return (v && v.state && typeof v.dispatch === 'function') ? v : null;
+  }
+
+  /* 往编辑器里塞一块文本，并确认它真的进去了 */
+  function insertPiece(cm, piece) {
+    const v = cmViewOf(cm);
+    if (v) {
+      const sel = v.state.selection.main;
+      const before = v.state.doc.length;
+      v.dispatch({
+        changes: { from: sel.from, to: sel.to, insert: piece },
+        selection: { anchor: sel.from + piece.length }
+      });
+      return v.state.doc.length === before - (sel.to - sel.from) + piece.length;
+    }
+
+    /* 没有 CM6 视图时退回浏览器输入管线，并确认长度增长 */
+    const host = cm.closest('.cm-editor') || cm;
+    const before = norm(host.innerText).length;
+    try { document.execCommand('insertText', false, piece); } catch (e) {}
+    let now = norm(host.innerText);
+    if (now.length === before) {
+      const target = host.querySelector('.cm-content') || host;
+      try { target.focus(); } catch (e) {}
+      try {
+        target.dispatchEvent(new InputEvent('beforeinput', {
+          inputType: 'insertText', data: piece, bubbles: true, cancelable: true
+        }));
+      } catch (e) {}
+      now = norm(host.innerText);
+      if (now.length === before) return false;
+    }
+    return now.endsWith(norm(piece)) ? true : 'partial';
+  }
+
+  /* 兜底：内容对不上时整段重写（只在异常路径上用） */
+  function repairCell(cm, want) {
+    const v = cmViewOf(cm);
+    if (v) {
+      v.dispatch({
+        changes: { from: 0, to: v.state.doc.length, insert: want },
+        selection: { anchor: want.length }
+      });
+      return;
+    }
+    const host = cm.closest('.cm-editor') || cm;
+    host.focus();
+    try { document.execCommand('selectAll'); } catch (e) {}
+    try { document.execCommand('insertText', false, want); } catch (e) {}
+  }
+
   /* 打字器：从队列消费，走浏览器真实输入管线 */
   async function typeLoop(cm, T) {
     cm.focus();
@@ -143,7 +202,16 @@
       const remain = T.text.length - idx;
       if (remain > 0) {
         const step = remain > 800 ? 8 : remain > 300 ? 3 : 1;
-        document.execCommand('insertText', false, T.text.slice(idx, idx + step));
+        const piece = T.text.slice(idx, idx + step);
+        let ok = false;
+        for (let tryN = 0; tryN < 5 && !ok; tryN++) {
+          const r = insertPiece(cm, piece);
+          if (r === true) ok = true;
+          else if (r === 'partial') { ok = true; T.suspect = true; }
+          else { cm.focus(); await sleep(25 + tryN * 35); }
+        }
+        /* 实在塞不进去就报错，别让后面的字错位 */
+        if (!ok) { const e = new Error('editor-busy'); e.code = 'editor'; throw e; }
         idx += step;
         idle = 0;
         await sleep(7 + Math.random() * 9);
@@ -191,7 +259,33 @@
     }
   }
 
-  /* agent 回的是自然语言，这里只留代码：优先取第一个围栏块 */
+  /* agent 回的是自然语言，这里只留代码。
+     1) 有围栏就取围栏内容
+     2) 没有围栏就找第一处"像代码"的位置，之前的说明文字整体丢掉 */
+  function findCodeStart(raw) {
+    /* 1) 有围栏：直接取围栏里的内容 */
+    const f = /```[a-zA-Z0-9_+-]*\r?\n/.exec(raw);
+    if (f) return f.index + f[0].length;
+    /* 2) 赋值语句最可靠，prose 里几乎不会出现 name = … */
+    const a = /[A-Za-z_]\w*(?:\[[^\]\n]*\])?(?:\.[A-Za-z_]\w*)*\s*=(?!=)/.exec(raw);
+    /* 3) 语句开头 */
+    const b = /(?:^|\n)[ \t]*(?:import\s|from\s+[A-Za-z_.]+\s+import\s|def\s|class\s|#|for\s|while\s|if\s|print\s*\(|@)/.exec(raw);
+    const cand = [];
+    if (a) cand.push(a.index);
+    if (b) cand.push(b.index + (b[0].startsWith("\n") ? 1 : 0));
+    return cand.length ? Math.min.apply(null, cand) : -1;
+  }
+
+  function isProse(t) {
+    if (!t) return false;
+    if (/^#/.test(t)) return false;                                  // 注释永远保留
+    if (/[=(){}\[\]+*/%]|^\s*(?:import|from|def|class|for|while|if|elif|else|try|except|with|return|print|assert|raise)\b/.test(t)) return false;
+    if (/[\u4e00-\u9fa5]/.test(t) && !/["']/.test(t)) return true;    // 中文且不在字符串里 → 说明文字
+    if (/[。！？]\s*$/.test(t)) return true;
+    if (/^(?:Here|Sure|This|Note|You|We|It|The|Below|Above|That)\b/i.test(t)) return true;
+    return false;
+  }
+
   function makeCodeFilter(out) {
     let raw = '';
     let mode = 'head';
@@ -202,12 +296,9 @@
         if (mode === 'done') return;
         raw += chunk;
         if (mode === 'head') {
-          const m = /```[a-zA-Z0-9_+-]*\r?\n/.exec(raw);
-          if (m) { mode = 'code'; buf = raw.slice(m.index + m[0].length); }
-          else if (/^(?:\s*#|\s*(?:import|from)\s|\s*def\s|\s*for\s|\s*print\(|[A-Za-z_]\w*\s*=[^=])/.test(raw)) {
-            /* 一眼就是代码，不必等解释文字 */
-            mode = 'code'; buf = raw;
-          } else if (raw.length > 300) { mode = 'code'; buf = raw; }
+          const at = findCodeStart(raw);
+          if (at >= 0) { mode = 'code'; buf = raw.slice(at); }
+          else if (raw.length > 400) { mode = 'code'; buf = raw; }
           else return;
         } else {
           /* 已经在代码模式：新来的块必须接上，否则只剩切换那一刻的快照 */
@@ -219,7 +310,19 @@
         if (buf.length > TAIL) { out(buf.slice(0, buf.length - TAIL)); buf = buf.slice(-TAIL); }
       },
       finish() {
-        if (mode === 'code' && buf) out(buf.replace(/\r?\n?```[\s\S]*$/, ''));
+        if (mode === 'code' && buf) {
+          let s = buf.replace(/\r?\n?```[\s\S]*$/, '');
+          const lines = s.split('\n');
+          /* 结尾若跟着 agent 的说明文字，切掉 */
+          while (lines.length) {
+            const t = lines[lines.length - 1].trim();
+            if (!t) { lines.pop(); continue; }
+            if (isProse(t)) { lines.pop(); continue; }
+            break;
+          }
+          s = lines.join('\n').replace(/^\s*\n+/, '');
+          if (s) out(s);
+        }
         buf = '';
       }
     };
@@ -244,10 +347,93 @@
     return _disc;
   }
 
+  /* 本地 llama-server（U 盘那套）：页面就由它提供，同源直连，不需要 key */
+  function localBases() {
+    const h = location.hostname;
+    if (h !== '127.0.0.1' && h !== 'localhost') return [];   // 线上站点不探本机，免得被拦
+    const out = [];
+    if (location.port && /^18\d{3}$/.test(location.port)) out.push(location.origin);
+    ['18480', '18481', '18482', '18483', '18490', '18500'].forEach(p => {
+      const b = 'http://127.0.0.1:' + p;
+      if (out.indexOf(b) < 0) out.push(b);
+    });
+    return out;
+  }
+
+  async function streamViaLocal(promptText, onDelta, base) {
+    base = base.replace(/\/+$/, '');
+
+    /* 端口没开就立刻收手，别让主人干等 */
+    const g = new AbortController();
+    const gt = setTimeout(() => g.abort(), 700);
+    let ok = false;
+    try {
+      const r = await fetch(base + '/v1/models', { signal: g.signal });
+      ok = r.ok;
+    } catch (e) {
+      ok = false;
+    } finally {
+      clearTimeout(gt);
+    }
+    if (!ok) throw new Error('local off');
+
+    const ac = new AbortController();
+    let idle = setTimeout(() => ac.abort(), 120000);   // 本地模型首包可能慢
+    const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), 120000); };
+
+    const r = await fetch(base + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ac.signal,
+      body: JSON.stringify({
+        messages: [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: promptText }
+        ],
+        max_tokens: 1024,
+        temperature: 0.15,
+        top_p: 0.9,
+        stream: true
+      })
+    });
+    if (!r.ok) { clearTimeout(idle); throw new Error('local ' + r.status); }
+
+    let got = 0;
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let carry = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bump();
+        carry += dec.decode(value, { stream: true });
+        const lines = carry.split('\n');
+        carry = lines.pop();
+        for (const line of lines) {
+          const s = line.trim();
+          if (!s.startsWith('data:')) continue;
+          const pl = s.slice(5).trim();
+          if (!pl || pl === '[DONE]') continue;
+          try {
+            const j = JSON.parse(pl);
+            const d = j.choices && j.choices[0] && j.choices[0].delta;
+            if (d && d.content) { got += d.content.length; onDelta(d.content); }
+          } catch (e) {}
+        }
+      }
+    } finally {
+      clearTimeout(idle);
+    }
+    if (!got) { const e = new Error('local empty'); e.code = 'empty'; throw e; }
+    dbg('local ' + got + 'ch');
+  }
+
   /* 走本机桥接（bridge.py）：由它绑到专用会话，逐字吐文本回来 */
   async function streamViaACP(promptText, onDelta, base) {
     base = base.replace(/\/+$/, '');
-    const instr = '只输出可以直接运行的 Python 代码，不要任何解释，不要用 ``` 包裹。需求：' + promptText;
+    const instr = '你现在只做一件事：把需求翻译成可直接运行的 Python 代码。'
+      + '输出必须以代码开头，不要任何解释、寒暄、前后说明，不要用 ``` 包裹。需求：' + promptText;
 
     const ac = new AbortController();
     let idle = setTimeout(() => ac.abort(), 45000);   // 首包上限
@@ -318,6 +504,7 @@
     const list = (Array.isArray(CFG.acp) ? CFG.acp.slice() : [CFG.acp]).filter(Boolean);
     if (CFG.remote && list.indexOf(CFG.remote) < 0) list.push(CFG.remote);
 
+    /* 1) 本机桥 / 2) 公网隧道 */
     for (const base of list) {
       try {
         await streamViaACP(promptText, onDelta, base);
@@ -326,6 +513,16 @@
         dbg('acp ' + base + ' -> ' + (e && e.message ? e.message : e));
         /* 端口在、只是忙：换下一个口也一样忙，直接走回退 */
         if (e && e.code === 'busy') break;
+      }
+    }
+
+    /* 3) 本地模型（如果那台机器上开着），同源、不需要 key */
+    for (const base of localBases()) {
+      try {
+        await streamViaLocal(promptText, onDelta, base);
+        return;
+      } catch (e) {
+        dbg('local ' + base + ' -> ' + (e && e.message ? e.message : e));
       }
     }
 
@@ -424,8 +621,15 @@
 
       if (T.err) throw T.err;
 
-      const got = (cm.textContent || '').replace(/\u200b/g, '').length;
-      dbg('done ' + got + '/' + T.text.length);
+      /* 对账：忽略缩进差异，只核对真正的字符有没有丢 */
+      const got = pack(norm(cm.innerText || ''));
+      const want = pack(T.text);
+      if (got !== want) {
+        dbg('repair ' + got.length + '->' + want.length);
+        repairCell(cm, T.text);
+      }
+      dbg('done ' + got.length + '/' + want.length + (T.suspect ? ' (suspect)' : ''));
+      window.__icLast = { text: T.text, cell: norm(cm.innerText || '') };
       return T.text;
     } catch (err) {
       busy = false; /* 先释放，否则无法唤起输入条 */
