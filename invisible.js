@@ -266,10 +266,10 @@
   /* ---- 品牌对齐：左上角换成 Jupyter 官方图标与文字 ---- */
   #jp-NotebookLogo > svg{display:none !important}
   #jp-NotebookLogo{display:inline-flex !important;align-items:center;gap:5px;padding-left:5px}
-  #jp-NotebookLogo::before{content:'';flex:none;width:19px;height:22px;
+  #jp-NotebookLogo::before{content:'';flex:none;width:23px;height:27px;
     background:url(../jupyter-logo.svg) no-repeat center/contain}
   #jp-NotebookLogo::after{content:'jupyter';font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;
-    font-size:17px;font-weight:400;color:#4E4E4E;letter-spacing:.2px;line-height:1}
+    font-size:18px;font-weight:400;color:#4E4E4E;letter-spacing:.1px;line-height:1}
   /* Lite 没有签名信任机制，不显示一个并不成立的状态 */
   .jp-NotebookTrustedStatus{display:none !important}
   /* ---- 入口 ---- */
