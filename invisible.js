@@ -293,7 +293,7 @@
     return out;
   }
 
-  async function streamViaLocal(promptText, onDelta, base) {
+  async function streamViaLocal(promptText, onDelta, base, outer) {
     base = base.replace(/\/+$/, '');
 
     /* 端口没开就立刻收手，别让主人干等 */
@@ -313,6 +313,8 @@
     const ac = new AbortController();
     let idle = setTimeout(() => ac.abort(), 120000);   // 本地模型首包可能慢
     const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), 120000); };
+    const link = () => { try { ac.abort(); } catch (e) {} };
+    if (outer) { if (outer.aborted) link(); else outer.addEventListener('abort', link); }
 
     const r = await fetch(base + '/v1/chat/completions', {
       method: 'POST',
@@ -357,13 +359,14 @@
       }
     } finally {
       clearTimeout(idle);
+      if (outer) { try { outer.removeEventListener('abort', link); } catch (e) {} }
     }
     if (!got) { const e = new Error('local empty'); e.code = 'empty'; throw e; }
     dbg('local ' + got + 'ch');
   }
 
   /* 走本机桥接（bridge.py）：由它绑到专用会话，逐字吐文本回来 */
-  async function streamViaACP(promptText, onDelta, base) {
+  async function streamViaACP(promptText, onDelta, base, outer) {
     base = base.replace(/\/+$/, '');
     const instr = '你现在只做一件事：把需求翻译成可直接运行的 Python 代码。'
       + '输出必须以代码开头，不要任何解释、寒暄、前后说明，不要用 ``` 包裹。需求：' + promptText;
@@ -371,6 +374,9 @@
     const ac = new AbortController();
     let idle = setTimeout(() => ac.abort(), 45000);   // 首包上限
     const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), 120000); };
+    /* 外部的取消（主人按 Esc）和内部的超时共用一个中断器 */
+    const link = () => { try { ac.abort(); } catch (e) {} };
+    if (outer) { if (outer.aborted) link(); else outer.addEventListener('abort', link); }
 
     let got = 0;
     let chunkN = 0, deltaN = 0, head = '';
@@ -415,13 +421,15 @@
       }
     } catch (e) {
       if (e && e.name === 'AbortError') {
-        const busy = new Error('gen busy');
-        busy.code = 'busy';
-        throw busy;
+        const cancelled = !!(outer && outer.aborted);
+        const err = new Error(cancelled ? 'cancelled' : 'gen busy');
+        err.code = cancelled ? 'cancel' : 'busy';
+        throw err;
       }
       throw e;
     } finally {
       clearTimeout(idle);
+      if (outer) { try { outer.removeEventListener('abort', link); } catch (e) {} }
     }
     if (!got) {
       const e = new Error('gen empty');
@@ -431,7 +439,15 @@
     dbg('gen ' + chunkN + 'c/' + deltaN + 'd/' + got + 'ch');
   }
 
-  async function streamCode(promptText, onDelta) {
+  /* 主人按 Esc → 中断并立刻放弃，不要再往备用通道上撞 */
+  function cancelErr(e, outer) {
+    if (!outer || !outer.aborted) return null;
+    const x = new Error('cancelled');
+    x.code = 'cancel';
+    return x;
+  }
+
+  async function streamCode(promptText, onDelta, outer) {
     /* 本机桥优先，其次公网隧道；都不通才回退直连模型 */
     try { await ensureDiscovered(); } catch (e) {}
     const list = (Array.isArray(CFG.acp) ? CFG.acp.slice() : [CFG.acp]).filter(Boolean);
@@ -440,9 +456,11 @@
     /* 1) 本机桥 / 2) 公网隧道 */
     for (const base of list) {
       try {
-        await streamViaACP(promptText, onDelta, base);
+        await streamViaACP(promptText, onDelta, base, outer);
         return;
       } catch (e) {
+        const cx = cancelErr(e, outer);
+        if (cx) throw cx;
         dbg('acp ' + base + ' -> ' + (e && e.message ? e.message : e));
         /* 端口在、只是忙：换下一个口也一样忙，直接走回退 */
         if (e && e.code === 'busy') break;
@@ -452,9 +470,11 @@
     /* 3) 本地模型（如果那台机器上开着），同源、不需要 key */
     for (const base of localBases()) {
       try {
-        await streamViaLocal(promptText, onDelta, base);
+        await streamViaLocal(promptText, onDelta, base, outer);
         return;
       } catch (e) {
+        const cx = cancelErr(e, outer);
+        if (cx) throw cx;
         dbg('local ' + base + ' -> ' + (e && e.message ? e.message : e));
       }
     }
@@ -466,7 +486,8 @@
       const r = await fetch(CFG.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: promptText })
+        body: JSON.stringify({ prompt: promptText }),
+        signal: outer
       });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const d = await r.json();
@@ -491,7 +512,8 @@
           { role: 'system', content: SYSTEM },
           { role: 'user', content: promptText }
         ]
-      })
+      }),
+      signal: outer
     });
 
     if (!res.ok) {
@@ -528,16 +550,35 @@
   /* ================= 主流程 ================= */
 
   let busy = false;
+  let queue = [];        /* 上一问还没写完时，主人又提交的需求按顺序排在这里 */
+  let holdDrain = false; /* 缺 key 时先扣住队列，免得一口气全撞成 nokey */
+  let cur = null;        /* 当前这一问：{ text, ac } */
 
   async function run(promptText) {
-    if (busy) return null;
+    if (!promptText) return null;
+    if (busy) {
+      /* 不丢、不覆盖、不并发：排到后面，等这一问收完再接着做 */
+      if (queue.length < 20) queue.push(promptText);
+      dbg('queued ' + queue.length);
+      toast('当前还在生成，已排在第 ' + queue.length + ' 个');
+      sync();
+      return null;
+    }
+
     busy = true;
+    cur = { text: promptText, ac: new AbortController() };
+    sync();
     dbg('run');
 
     try {
       /* 1) 先把整段回复收完，编辑器一点不动 */
       let raw = '';
-      await streamCode(promptText, chunk => { raw += chunk; });
+      await streamCode(promptText, chunk => { raw += chunk; }, cur.ac.signal);
+      if (cur.ac.signal.aborted) {
+        const e = new Error('cancelled');
+        e.code = 'cancel';
+        throw e;
+      }
       window.__icRaw = raw;
 
       /* 2) 一次性切成干净代码 */
@@ -558,15 +599,37 @@
       window.__icLast = { text: code, cell: norm(cm.innerText || '') };
       return code;
     } catch (err) {
-      busy = false; /* 先释放，否则无法唤起输入条 */
       const c = err && err.code;
       dbg('err ' + (err && err.message ? err.message : String(err)));
-      if (c === 'nokey') { pendingText = promptText; askKey(); }
+      /* 取消发生在写入之前，单元格一个字符都没被碰过 */
+      if (c === 'nokey') { pendingText = promptText; holdDrain = true; askKey(); }
+      else if (c === 'cancel') { toast('已取消'); }
       else { toast(err && err.message ? err.message : '生成失败'); }
       return null;
     } finally {
       busy = false;
+      cur = null;
+      sync();
+      if (!holdDrain && queue.length) setTimeout(drain, 80);
     }
+  }
+
+  function drain() {
+    if (busy || holdDrain || !queue.length) return;
+    const next = queue.shift();
+    sync();
+    run(next);
+  }
+
+  /* 取消当前这一问连同排队的一起撤掉：Esc 的语义是「这些我都不要了」 */
+  function cancelCurrent() {
+    if (!busy || !cur) return false;
+    queue = [];
+    if (!cur.ac.signal.aborted) {
+      try { cur.ac.abort(); } catch (e) {}
+    }
+    sync();
+    return true;
   }
 
   /* ================= 极简交互层 ================= */
@@ -590,6 +653,10 @@
   #ic-trigger::after{content:'';position:absolute;right:18px;bottom:18px;width:6px;height:6px;
     border-radius:50%;background:#bdbdbd;transition:all .25s ease}
   #ic-trigger:hover::after{background:#1976d2;box-shadow:0 0 7px rgba(25,118,210,.45)}
+  /* 生成中：小圆点呼吸，证明它真的在干活（主人上次以为卡死就是缺这个） */
+  #ic-trigger.busy::after{background:#1976d2;box-shadow:0 0 7px rgba(25,118,210,.45);
+    animation:ic-pulse 1.1s ease-in-out infinite}
+  @keyframes ic-pulse{0%,100%{transform:scale(1);opacity:.95}50%{transform:scale(2.1);opacity:.3}}
   #ic-bar{position:fixed;left:0;right:0;bottom:0;z-index:99999;height:38px;display:flex;
     align-items:center;gap:10px;padding:0 16px;background:#fff;border-top:1px solid #e0e0e0;
     box-shadow:0 -2px 6px rgba(0,0,0,.06);transform:translateY(101%);
@@ -636,18 +703,34 @@
     ui.input.value = '';
     ui.input.placeholder = '…';
     ui.hint.textContent = 'enter';
+    sync();
   }
 
+  /* 生成中也要能打开输入条：让主人看得见「它还在动」，并且可以先把下一问排进来 */
   function open() {
-    if (busy) return;
     ui.bar.classList.add('open');
     ui.input.focus();
+    sync();
   }
 
   function close() {
     ui.bar.classList.remove('open');
     ui.input.value = '';
     ui.input.blur();
+  }
+
+  /* 输入条的状态显示：闲 / 生成中 / 生成中且有排队 */
+  function sync() {
+    if (!ui || !ui.input) return;
+    if (ui.trigger) ui.trigger.classList.toggle('busy', !!busy);
+    if (ui.mode !== 'task') return;
+    if (busy) {
+      ui.hint.textContent = queue.length ? '生成中 · 排队 ' + queue.length : '生成中 · Esc 取消';
+      ui.input.placeholder = '生成中，回车排到这一问后面…';
+    } else {
+      ui.hint.textContent = queue.length ? '排队 ' + queue.length : 'enter';
+      ui.input.placeholder = '…';
+    }
   }
 
   function mountUI() {
@@ -700,7 +783,13 @@
     });
 
     ui.input.addEventListener('keydown', e => {
-      if (e.key === 'Escape') return close();
+      if (e.key === 'Escape') {
+        /* 先清字，避免手滑把正在生成的任务取消掉 */
+        if (ui.input.value) { ui.input.value = ''; return; }
+        /* 生成中按 Esc = 取消这一问；排队的也一起撤掉，不然马上又开跑 */
+        if (busy && cancelCurrent()) return;
+        return close();
+      }
       if (e.key !== 'Enter') return;
       const text = ui.input.value.trim();
       if (!text) return close();
@@ -710,10 +799,19 @@
         close();
         taskMode();
         toast('已保存在本机');
+        holdDrain = false;
         /* 如果是刚才因为缺 key 中断的任务，补跑一次 */
         const p = pendingText;
         pendingText = '';
         if (p) run(p);
+        return;
+      }
+
+      /* 生成中提交：条不关，主人能看见「排在第几个」 */
+      if (busy) {
+        ui.input.value = '';
+        run(text);
+        sync();
         return;
       }
       close();
@@ -724,6 +822,8 @@
       open: () => { taskMode(); open(); },
       close,
       run,
+      cancel: cancelCurrent,
+      state: () => ({ busy, queued: queue.length }),
       resetKey: () => { setKey(''); toast('已清除本机 key'); },
       cfg: CFG,
       discover: ensureDiscovered
