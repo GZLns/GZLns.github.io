@@ -455,13 +455,16 @@
 
     /* 1) 本机桥 / 2) 公网隧道 */
     for (const base of list) {
+      const t = Date.now();
       try {
         await streamViaACP(promptText, onDelta, base, outer);
+        dbg('acp ok ' + base + ' ' + ((Date.now() - t) / 1000).toFixed(1) + 's');
         return;
       } catch (e) {
         const cx = cancelErr(e, outer);
         if (cx) throw cx;
-        dbg('acp ' + base + ' -> ' + (e && e.message ? e.message : e));
+        dbg('acp ' + base + ' -> ' + (e && e.message ? e.message : e) +
+            ' after ' + ((Date.now() - t) / 1000).toFixed(1) + 's');
         /* 端口在、只是忙：换下一个口也一样忙，直接走回退 */
         if (e && e.code === 'busy') break;
       }
@@ -469,13 +472,16 @@
 
     /* 3) 本地模型（如果那台机器上开着），同源、不需要 key */
     for (const base of localBases()) {
+      const t = Date.now();
       try {
         await streamViaLocal(promptText, onDelta, base, outer);
+        dbg('local ok ' + base + ' ' + ((Date.now() - t) / 1000).toFixed(1) + 's');
         return;
       } catch (e) {
         const cx = cancelErr(e, outer);
         if (cx) throw cx;
-        dbg('local ' + base + ' -> ' + (e && e.message ? e.message : e));
+        dbg('local ' + base + ' -> ' + (e && e.message ? e.message : e) +
+            ' after ' + ((Date.now() - t) / 1000).toFixed(1) + 's');
       }
     }
 
@@ -568,12 +574,14 @@
     busy = true;
     cur = { text: promptText, ac: new AbortController() };
     sync();
+    const T0 = Date.now();
     dbg('run');
 
     try {
       /* 1) 先把整段回复收完，编辑器一点不动 */
       let raw = '';
       await streamCode(promptText, chunk => { raw += chunk; }, cur.ac.signal);
+      const T1 = Date.now();
       if (cur.ac.signal.aborted) {
         const e = new Error('cancelled');
         e.code = 'cancel';
@@ -595,7 +603,8 @@
       await sleep(40);
       pasteCode(cm, code);
 
-      dbg('done ' + code.length + 'ch');
+      dbg('done ' + code.length + 'ch 取词' + ((T1 - T0) / 1000).toFixed(1) +
+          's 落字' + ((Date.now() - T1) / 1000).toFixed(1) + 's');
       window.__icLast = { text: code, cell: norm(cm.innerText || '') };
       return code;
     } catch (err) {
