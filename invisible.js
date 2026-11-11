@@ -293,52 +293,58 @@
     return out;
   }
 
-  async function streamViaLocal(promptText, onDelta, base, outer) {
+  /* 统一取词器：本地模型、桥、任何 OpenAI 兼容端点都走这一条。
+     协议统一之后，接一个新后端不需要再写一套解析。 */
+  async function streamOpenAI(promptText, onDelta, base, outer, opt) {
+    opt = opt || {};
     base = base.replace(/\/+$/, '');
+    const hdr = { 'Content-Type': 'application/json' };
+    if (opt.key) hdr['Authorization'] = 'Bearer ' + opt.key;
 
-    /* 端口没开就立刻收手，别让主人干等 */
+    /* 探活：没开就立刻收手，别让主人干等 */
     const g = new AbortController();
-    const gt = setTimeout(() => g.abort(), 700);
+    const gt = setTimeout(() => g.abort(), opt.probe || 900);
     let ok = false;
     try {
-      const r = await fetch(base + '/v1/models', { signal: g.signal });
+      const r = await fetch(base + '/v1/models', { headers: hdr, signal: g.signal });
       ok = r.ok;
     } catch (e) {
       ok = false;
     } finally {
       clearTimeout(gt);
     }
-    if (!ok) throw new Error('local off');
+    if (!ok) throw new Error('off');
 
     const ac = new AbortController();
-    let idle = setTimeout(() => ac.abort(), 120000);   // 本地模型首包可能慢
-    const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), 120000); };
+    let idle = setTimeout(() => ac.abort(), opt.first || 60000);
+    const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), opt.idle || 120000); };
     const link = () => { try { ac.abort(); } catch (e) {} };
     if (outer) { if (outer.aborted) link(); else outer.addEventListener('abort', link); }
 
-    const r = await fetch(base + '/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: ac.signal,
-      body: JSON.stringify({
-        messages: [
-          { role: 'system', content: SYSTEM },
-          { role: 'user', content: promptText }
-        ],
-        max_tokens: 1024,
-        temperature: 0.15,
-        top_p: 0.9,
-        stream: true
-      })
-    });
-    if (!r.ok) { clearTimeout(idle); throw new Error('local ' + r.status); }
-
     let got = 0;
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let carry = '';
     try {
-      while (true) {
+      const r = await fetch(base + '/v1/chat/completions', {
+        method: 'POST',
+        headers: hdr,
+        signal: ac.signal,
+        body: JSON.stringify({
+          model: opt.model || 'default',
+          messages: [
+            { role: 'system', content: opt.system || SYSTEM },
+            { role: 'user', content: promptText }
+          ],
+          max_tokens: opt.maxTokens || 1024,
+          temperature: opt.temperature != null ? opt.temperature : 0.15,
+          top_p: 0.9,
+          stream: true
+        })
+      });
+      if (!r.ok) throw new Error('http ' + r.status);
+
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let carry = '';
+      for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
         bump();
@@ -350,79 +356,24 @@
           if (!s.startsWith('data:')) continue;
           const pl = s.slice(5).trim();
           if (!pl || pl === '[DONE]') continue;
-          try {
-            const j = JSON.parse(pl);
-            const d = j.choices && j.choices[0] && j.choices[0].delta;
-            if (d && d.content) { got += d.content.length; onDelta(d.content); }
-          } catch (e) {}
-        }
-      }
-    } finally {
-      clearTimeout(idle);
-      if (outer) { try { outer.removeEventListener('abort', link); } catch (e) {} }
-    }
-    if (!got) { const e = new Error('local empty'); e.code = 'empty'; throw e; }
-    dbg('local ' + got + 'ch');
-  }
-
-  /* 走本机桥接（bridge.py）：由它绑到专用会话，逐字吐文本回来 */
-  async function streamViaACP(promptText, onDelta, base, outer) {
-    base = base.replace(/\/+$/, '');
-    const instr = '你现在只做一件事：把需求翻译成可直接运行的 Python 代码。'
-      + '输出必须以代码开头，不要任何解释、寒暄、前后说明，不要用 ``` 包裹。需求：' + promptText;
-
-    const ac = new AbortController();
-    let idle = setTimeout(() => ac.abort(), 45000);   // 首包上限
-    const bump = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), 120000); };
-    /* 外部的取消（主人按 Esc）和内部的超时共用一个中断器 */
-    const link = () => { try { ac.abort(); } catch (e) {} };
-    if (outer) { if (outer.aborted) link(); else outer.addEventListener('abort', link); }
-
-    let got = 0;
-    let chunkN = 0, deltaN = 0, head = '';
-    try {
-      const hdr = { 'Content-Type': 'application/json' };
-      if (CFG.bkey) hdr['X-Bridge-Key'] = CFG.bkey;
-      const r = await fetch(base + '/gen', {
-        method: 'POST',
-        headers: hdr,
-        body: JSON.stringify({ text: instr }),
-        signal: ac.signal
-      });
-      if (!r.ok) throw new Error('gen ' + r.status);
-
-      const reader = r.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        chunkN++;
-        buf += dec.decode(value, { stream: true });
-        let cut;
-        while ((cut = buf.indexOf('\n\n')) >= 0) {
-          const block = buf.slice(0, cut);
-          buf = buf.slice(cut + 2);
-          for (const line of block.split('\n')) {
-            if (!line.startsWith('data:')) continue;
-            let m;
-            try { m = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
-            if (m.delta) { bump(); got += m.delta.length; deltaN++; if (head.length < 90) head += m.delta; onDelta(m.delta); }
-            else if (m.error) {
-              if (!got) {
-                const e = new Error('gen ' + m.error);
-                e.code = 'bridge';
-                throw e;
-              }
-              dbg('gen error ' + m.error);
+          let j;
+          try { j = JSON.parse(pl); } catch (e) { continue; }
+          if (j.error) {
+            if (!got) {
+              const e = new Error('gen ' + (j.error.message || j.error));
+              e.code = 'bridge';
+              throw e;
             }
+            continue;
           }
+          const d = j.choices && j.choices[0] && j.choices[0].delta;
+          if (d && d.content) { got += d.content.length; onDelta(d.content); }
         }
       }
     } catch (e) {
       if (e && e.name === 'AbortError') {
         const cancelled = !!(outer && outer.aborted);
-        const err = new Error(cancelled ? 'cancelled' : 'gen busy');
+        const err = new Error(cancelled ? 'cancelled' : 'busy');
         err.code = cancelled ? 'cancel' : 'busy';
         throw err;
       }
@@ -431,12 +382,26 @@
       clearTimeout(idle);
       if (outer) { try { outer.removeEventListener('abort', link); } catch (e) {} }
     }
-    if (!got) {
-      const e = new Error('gen empty');
-      e.code = 'empty';
-      throw e;
-    }
-    dbg('gen ' + chunkN + 'c/' + deltaN + 'd/' + got + 'ch');
+    if (!got) { const e = new Error('empty'); e.code = 'empty'; throw e; }
+  }
+
+  /* 本地模型：同源，一跳，无状态 */
+  async function streamViaLocal(promptText, onDelta, base, outer) {
+    await streamOpenAI(promptText, onDelta, base, outer, { first: 120000 });
+    dbg('local ok ' + base);
+  }
+
+  /* 本机 agent：同一个协议，只是换了端点与凭据 */
+  async function streamViaACP(promptText, onDelta, base, outer) {
+    const instr = '你现在只做一件事：把需求翻译成可直接运行的 Python 代码。'
+      + '输出必须以代码开头，不要任何解释、寒暄、前后说明，不要用 ``` 包裹。需求：' + promptText;
+    await streamOpenAI(instr, onDelta, base, outer, {
+      key: CFG.bkey,
+      model: 'workbuddy-agent',
+      system: SYSTEM,
+      first: 45000
+    });
+    dbg('acp ok ' + base);
   }
 
   /* 主人按 Esc → 中断并立刻放弃，不要再往备用通道上撞 */
